@@ -1,0 +1,150 @@
+-- (a) Database and seed data
+CREATE TABLE students (
+    student_id SERIAL PRIMARY KEY,
+    student_number VARCHAR(20) NOT NULL UNIQUE,
+    full_name VARCHAR(100) NOT NULL
+);
+
+CREATE TABLE applications (
+    application_id SERIAL PRIMARY KEY,
+    student_id INT NOT NULL REFERENCES students(student_id),
+    age_at_application INT NOT NULL CHECK (age_at_application > 0),
+    monthly_income NUMERIC(10, 2) NOT NULL CHECK (monthly_income >= 0),
+    average_mark NUMERIC(5, 2) NOT NULL CHECK (average_mark >= 0 AND average_mark <= 100),
+    submitted_on DATE NOT NULL DEFAULT CURRENT_DATE,
+    status VARCHAR(15) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'APPROVED', 'REJECTED'))
+);
+
+CREATE TABLE decision_audit (
+    audit_id SERIAL PRIMARY KEY,
+    application_id INT NOT NULL REFERENCES applications(application_id),
+    old_status VARCHAR(15) NOT NULL,
+    new_status VARCHAR(15) NOT NULL,
+    changed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO students (student_number, full_name) VALUES
+('SC001', 'Wendy Katongo'),
+('SC002', 'Xavier Lubinda'),
+('SC003', 'Yvonne Chisanga'),
+('SC004', 'Zackary Mwanza');
+
+INSERT INTO applications (student_id, age_at_application, monthly_income, average_mark, submitted_on, status) VALUES
+(1, 20, 1500.00, 82.50, CURRENT_DATE - 5, 'PENDING'), -- Qualifying
+(2, 18, 3000.00, 70.00, CURRENT_DATE - 4, 'PENDING'), -- Exact lower/upper boundary (Qualifying)
+(3, 25, 0.00, 91.00, CURRENT_DATE - 3, 'PENDING'),    -- Exact upper age boundary (Qualifying)
+(4, 17, 1200.00, 85.00, CURRENT_DATE - 3, 'PENDING'), -- Non-qualifying (Age < 18)
+(1, 22, 3000.01, 78.00, CURRENT_DATE - 2, 'PENDING'), -- Non-qualifying (Income > 3000)
+(2, 21, 2000.00, 69.99, CURRENT_DATE - 1, 'PENDING'); -- Non-qualifying (Mark < 70)
+
+-- (b) Function
+CREATE OR REPLACE FUNCTION fn_scholarship_eligible(p_age INT, p_income NUMERIC, p_mark NUMERIC)
+RETURNS BOOLEAN AS $$
+BEGIN
+    IF p_age IS NULL OR p_income IS NULL OR p_mark IS NULL THEN
+        RAISE EXCEPTION 'Eligibility inputs cannot be NULL';
+    END IF;
+
+    IF p_age <= 0 THEN
+        RAISE EXCEPTION 'Age must be positive';
+    END IF;
+
+    IF p_income < 0 THEN
+        RAISE EXCEPTION 'Monthly income cannot be negative';
+    END IF;
+
+    IF p_mark < 0 OR p_mark > 100 THEN
+        RAISE EXCEPTION 'Average mark must be between 0 and 100';
+    END IF;
+
+    RETURN (p_age BETWEEN 18 AND 25)
+       AND (p_income <= 3000.00)
+       AND (p_mark >= 70.00);
+END;
+$$ LANGUAGE plpgsql;
+
+-- (c) Procedure
+CREATE OR REPLACE PROCEDURE pr_assess_application(p_application_id INT)
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_age INT;
+    v_income NUMERIC(10, 2);
+    v_mark NUMERIC(5, 2);
+    v_status VARCHAR(15);
+    v_new_status VARCHAR(15);
+BEGIN
+    SELECT age_at_application, monthly_income, average_mark, status
+    INTO v_age, v_income, v_mark, v_status
+    FROM applications
+    WHERE application_id = p_application_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Application ID % does not exist', p_application_id;
+    END IF;
+
+    IF v_status <> 'PENDING' THEN
+        RAISE EXCEPTION 'Application ID % has already been assessed (status: %)', p_application_id, v_status;
+    END IF;
+
+    IF fn_scholarship_eligible(v_age, v_income, v_mark) THEN
+        v_new_status := 'APPROVED';
+    ELSE
+        v_new_status := 'REJECTED';
+    END IF;
+
+    UPDATE applications
+    SET status = v_new_status
+    WHERE application_id = p_application_id;
+END;
+$$;
+
+-- (d) Trigger
+CREATE OR REPLACE FUNCTION trg_fn_decision_audit()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.status IS DISTINCT FROM OLD.status THEN
+        INSERT INTO decision_audit (application_id, old_status, new_status, changed_at)
+        VALUES (NEW.application_id, OLD.status, NEW.status, CURRENT_TIMESTAMP);
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_applications_decision_audit
+AFTER UPDATE ON applications
+FOR EACH ROW
+EXECUTE FUNCTION trg_fn_decision_audit();
+
+-- (e) View
+CREATE OR REPLACE VIEW v_approved_applicants AS
+SELECT 
+    s.student_number,
+    s.full_name,
+    a.average_mark,
+    a.status
+FROM applications a
+JOIN students s ON a.student_id = s.student_id
+WHERE a.status = 'APPROVED';
+
+-- (f) Index
+-- Justification: Filtering by status equality first partitions the index by state (e.g., PENDING or APPROVED), allowing a fast range scan over submitted_on.
+CREATE INDEX idx_applications_status_date ON applications (status, submitted_on);
+
+EXPLAIN ANALYZE
+SELECT * FROM applications
+WHERE status = 'PENDING' AND submitted_on BETWEEN CURRENT_DATE - 7 AND CURRENT_DATE;
+
+-- (g) Scheduled job
+CREATE OR REPLACE PROCEDURE pr_assess_pending()
+LANGUAGE plpgsql AS $$
+DECLARE
+    rec RECORD;
+BEGIN
+    FOR rec IN SELECT application_id FROM applications WHERE status = 'PENDING' ORDER BY application_id LOOP
+        CALL pr_assess_application(rec.application_id);
+    END LOOP;
+END;
+$$;
+
+SELECT cron.schedule('weekly_assess_pending', '0 8 * * 1', $$CALL pr_assess_pending()$$);
