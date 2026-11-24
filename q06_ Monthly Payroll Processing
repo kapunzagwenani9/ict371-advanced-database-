@@ -1,0 +1,130 @@
+-- (a) Database and seed data
+CREATE TABLE employees (
+    employee_id SERIAL PRIMARY KEY,
+    full_name VARCHAR(100) NOT NULL,
+    basic_salary NUMERIC(12, 2) NOT NULL CHECK (basic_salary >= 0),
+    allowance NUMERIC(12, 2) NOT NULL CHECK (allowance >= 0),
+    deduction NUMERIC(12, 2) NOT NULL CHECK (deduction >= 0),
+    active BOOLEAN NOT NULL DEFAULT TRUE
+);
+
+CREATE TABLE payroll (
+    payroll_id SERIAL PRIMARY KEY,
+    employee_id INT NOT NULL REFERENCES employees(employee_id),
+    pay_month DATE NOT NULL CHECK (EXTRACT(DAY FROM pay_month) = 1),
+    gross_pay NUMERIC(12, 2) NOT NULL,
+    net_pay NUMERIC(12, 2) NOT NULL,
+    CONSTRAINT uq_emp_pay_month UNIQUE (employee_id, pay_month)
+);
+
+CREATE TABLE salary_audit (
+    audit_id SERIAL PRIMARY KEY,
+    employee_id INT NOT NULL REFERENCES employees(employee_id),
+    old_salary NUMERIC(12, 2) NOT NULL,
+    new_salary NUMERIC(12, 2) NOT NULL,
+    changed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO employees (full_name, basic_salary, allowance, deduction, active) VALUES
+('Nancy Zulu', 12000.00, 2000.00, 1500.00, TRUE),
+('Oscar Banda', 9500.00, 1000.00, 1100.00, TRUE),
+('Patricia Mumba', 15000.00, 3000.00, 2000.00, FALSE); -- Inactive
+
+INSERT INTO payroll (employee_id, pay_month, gross_pay, net_pay) VALUES
+(1, '2026-09-01', 14000.00, 12500.00),
+(2, '2026-09-01', 10500.00, 9400.00),
+(3, '2026-09-01', 18000.00, 16000.00),
+(1, '2026-10-01', 14000.00, 12500.00),
+(2, '2026-10-01', 10500.00, 9400.00);
+
+-- (b) Function
+CREATE OR REPLACE FUNCTION fn_net_pay(p_employee_id INT)
+RETURNS NUMERIC AS $$
+DECLARE
+    v_basic NUMERIC(12, 2);
+    v_allow NUMERIC(12, 2);
+    v_deduct NUMERIC(12, 2);
+    v_net NUMERIC(12, 2);
+BEGIN
+    SELECT basic_salary, allowance, deduction INTO v_basic, v_allow, v_deduct
+    FROM employees
+    WHERE employee_id = p_employee_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Unknown employee ID: %', p_employee_id;
+    END IF;
+
+    v_net := (v_basic + v_allow) - v_deduct;
+
+    IF v_net < 0 THEN
+        RAISE EXCEPTION 'Computed net pay cannot be negative for employee %', p_employee_id;
+    END IF;
+
+    RETURN v_net;
+END;
+$$ LANGUAGE plpgsql;
+
+-- (c) Procedure
+CREATE OR REPLACE PROCEDURE pr_process_payroll(p_month DATE)
+LANGUAGE plpgsql AS $$
+DECLARE
+    rec RECORD;
+    v_gross NUMERIC(12, 2);
+    v_net NUMERIC(12, 2);
+BEGIN
+    IF p_month IS NULL OR EXTRACT(DAY FROM p_month) <> 1 THEN
+        RAISE EXCEPTION 'p_month must be the first day of a month';
+    END IF;
+
+    FOR rec IN SELECT employee_id, basic_salary, allowance FROM employees WHERE active = TRUE LOOP
+        v_net := fn_net_pay(rec.employee_id);
+        v_gross := rec.basic_salary + rec.allowance;
+
+        INSERT INTO payroll (employee_id, pay_month, gross_pay, net_pay)
+        VALUES (rec.employee_id, p_month, v_gross, v_net)
+        ON CONFLICT (employee_id, pay_month) DO NOTHING;
+    END LOOP;
+END;
+$$;
+
+-- (d) Trigger
+CREATE OR REPLACE FUNCTION trg_fn_salary_audit()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.basic_salary IS DISTINCT FROM OLD.basic_salary THEN
+        INSERT INTO salary_audit (employee_id, old_salary, new_salary, changed_at)
+        VALUES (NEW.employee_id, OLD.basic_salary, NEW.basic_salary, CURRENT_TIMESTAMP);
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_employees_salary_audit
+AFTER UPDATE ON employees
+FOR EACH ROW
+EXECUTE FUNCTION trg_fn_salary_audit();
+
+-- (e) View
+CREATE OR REPLACE VIEW v_payroll_report AS
+SELECT 
+    e.full_name,
+    p.pay_month,
+    p.gross_pay,
+    p.net_pay
+FROM payroll p
+JOIN employees e ON p.employee_id = e.employee_id;
+
+-- (f) Index
+-- Justification: The existing unique constraint on (employee_id, pay_month) cannot efficiently serve queries filtering solely by pay_month because pay_month is the trailing column. A standalone index on pay_month resolves this.
+CREATE INDEX idx_payroll_pay_month ON payroll (pay_month);
+
+-- (g) Scheduled job
+SELECT cron.schedule(
+    'monthly_payroll_run',
+    '0 2 1 * *',
+    $$CALL pr_process_payroll((DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month')::DATE)$$
+);
+
+-- Inspecting the job and its run history:
+SELECT * FROM cron.job WHERE jobname = 'monthly_payroll_run';
+SELECT * FROM cron.job_run_details ORDER BY start_time DESC LIMIT 10;
